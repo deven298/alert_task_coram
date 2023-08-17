@@ -1,8 +1,4 @@
 import sqlalchemy as sa
-import datetime
-import pytz
-
-timezone = pytz.UTC
 
 def database_connection() -> sa.Connection:
     engine = sa.create_engine("postgresql://postgres:postgres@postgres:5432/postgres")
@@ -18,59 +14,54 @@ def database_connection() -> sa.Connection:
 
 
 def ingest_data(conn: sa.Connection, timestamp: str, detection_type: str):
-    db_ingest_table = sa.table("detections",
-                              sa.column("id"),
-                              sa.column("time"),
-                              sa.column("type"))
     conn.execute(
-        sa.insert(db_ingest_table).values(
-            {
-                "time": timestamp,
-                "type": detection_type,
-            }
+        sa.text(
+            "INSERT INTO detections (time, type) VALUES (:timestamp, :detection_type)"
+        ).bindparams(
+            timestamp=timestamp, 
+            detection_type=detection_type
         )
     )
-    conn.commit()
-    # print(f'Data ingested at {timestamp}, of type {detection_type}')
 
 
 def aggregate_detections(conn: sa.Connection) -> dict[str, list[tuple[str, str]]]:
-    result = conn.execute(
-        sa.text("SELECT * FROM detections")
-    )
-    data = result.all()
-    # print(f'Results for aggregating detections {data}, {len(data)}')
-    aggregated_data = {}
-    for row in data:
-        _, time, detection_type = row.tuple()
-        # print(f'Data row {time}, {detection_type}')
-        type_aggregated_value = aggregated_data.get(detection_type, [])
+    query = """
+        WITH interval_calculations AS (
+            SELECT type,
+                   time,
+                   time - LAG(time) OVER (PARTITION BY type ORDER BY time) AS time_diff
+            FROM detections
+        )
+        SELECT type,
+               MIN(time) AS start_time,
+               MAX(time) AS end_time
+        FROM (
+            SELECT type,
+                   time,
+                   SUM(CASE WHEN time_diff IS NULL OR time_diff > INTERVAL '1 minute' THEN 1 ELSE 0 END) OVER (PARTITION BY type ORDER BY time) AS interval_group
+            FROM interval_calculations
+        ) subquery
+        GROUP BY type, interval_group
+        ORDER BY start_time
+    """
+
+    result = conn.execute(sa.text(query))
+    aggregate_results = {
+        "people": [],
+        "vehicles": [],
+    }
+
+    for row in result:
+        detection_type, start_time, end_time = row
         
-        if len(type_aggregated_value) == 0:
-            type_aggregated_value.append((time.strftime("%Y-%m-%dT%H:%M:%S"), time.strftime("%Y-%m-%dT%H:%M:%S")))
+        if detection_type in ["pedestrian", "bicycle"]:
+            category = "people"
         else:
-            last_aggregated_start_time, last_aggregated_end_time = type_aggregated_value[-1]
-            last_aggregated_end_time_offset_unaware = datetime.datetime.strptime(last_aggregated_end_time, "%Y-%m-%dT%H:%M:%S")
-            last_aggregated_end_time_offset_aware = timezone.localize(last_aggregated_end_time_offset_unaware)
-            if time - last_aggregated_end_time_offset_aware <= datetime.timedelta(minutes=1):
-                last_aggregated_end_time = time.strftime("%Y-%m-%dT%H:%M:%S")
-                type_aggregated_value[-1] = (last_aggregated_start_time, last_aggregated_end_time)
-            else:
-                type_aggregated_value.append((time.strftime("%Y-%m-%dT%H:%M:%S"), time.strftime("%Y-%m-%dT%H:%M:%S")))
+            category = "vehicles"
 
-        aggregated_data[detection_type] = type_aggregated_value
-    return aggregated_data
+        aggregate_results[category].append((start_time.strftime("%Y-%m-%dT%H:%M:%S"), end_time.strftime("%Y-%m-%dT%H:%M:%S")))
 
-def clean_data(conn: sa.Connection):
-    db_delete_table = sa.table("detections",
-                              sa.column("id"),
-                              sa.column("time"),
-                              sa.column("type"))
-    result = conn.execute(
-        sa.delete(db_delete_table).returning()
-    )
-    conn.commit()
-    print(f'Deleted existing data {result}')
+    return aggregate_results
     
 def main():
     conn = database_connection()
@@ -87,11 +78,18 @@ def main():
         ("2023-08-10T18:37:00", "pedestrian"),
         ("2023-08-10T18:37:30", "pedestrian"),
     ]
-    # clean up the detections table
-    clean_data(conn)
     
+    # add alert
+    consecutive_count = 0
     for timestamp, detection_type in detections:
         ingest_data(conn, timestamp, detection_type)
+        
+        if detection_type in ["pedestrian", "bicycle"]:
+            consecutive_count += 1
+            if consecutive_count >= 5:
+                print(f"ALERT: Unusual activity - person detected for a long time.")
+        else:
+            consecutive_count = 0
 
     aggregate_results = aggregate_detections(conn)
     print(aggregate_results)
