@@ -1,4 +1,8 @@
 import sqlalchemy as sa
+from datetime import datetime, timedelta
+import pytz
+
+timezone = pytz.UTC
 
 def database_connection() -> sa.Connection:
     engine = sa.create_engine("postgresql://postgres:postgres@postgres:5432/postgres")
@@ -23,6 +27,12 @@ def ingest_data(conn: sa.Connection, timestamp: str, detection_type: str):
         )
     )
 
+def format_time(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+def convert_string(dtstr):
+    time = datetime.strptime(dtstr, "%Y-%m-%dT%H:%M:%S")
+    return timezone.localize(time)
 
 def aggregate_detections(conn: sa.Connection) -> dict[str, list[tuple[str, str]]]:
     query = """
@@ -53,13 +63,22 @@ def aggregate_detections(conn: sa.Connection) -> dict[str, list[tuple[str, str]]
 
     for row in result:
         detection_type, start_time, end_time = row
+        interval = (format_time(start_time), format_time(end_time))
         
         if detection_type in ["pedestrian", "bicycle"]:
             category = "people"
         else:
             category = "vehicles"
 
-        aggregate_results[category].append((start_time.strftime("%Y-%m-%dT%H:%M:%S"), end_time.strftime("%Y-%m-%dT%H:%M:%S")))
+        # Combine intervals that are less than 1 minute apart in the same category
+        if aggregate_results[category]:
+            last_end_time = convert_string(aggregate_results[category][-1][1])
+            if start_time - last_end_time <= timedelta(minutes=1):
+                aggregate_results[category][-1] = (aggregate_results[category][-1][0], format_time(end_time))
+            else:
+                aggregate_results[category].append(interval)
+        else:
+            aggregate_results[category].append(interval)
 
     return aggregate_results
     
@@ -75,8 +94,14 @@ def main():
         ("2023-08-10T18:35:00", "pedestrian"),
         ("2023-08-10T18:35:30", "pedestrian"),
         ("2023-08-10T18:36:00", "pedestrian"),
-        ("2023-08-10T18:37:00", "pedestrian"),
+        ("2023-08-10T18:37:00", "bicycle"),
         ("2023-08-10T18:37:30", "pedestrian"),
+        ("2023-08-10T18:37:30", "bicycle"),
+        ("2023-08-10T18:37:30", "car"),
+        ("2023-08-10T18:37:30", "truck"),
+        ("2023-08-10T18:38:00", "van"),
+        ("2023-08-10T18:38:30", "truck"),
+        ("2023-08-10T18:39:00", "car"),
     ]
     
     # add alert
